@@ -1,13 +1,38 @@
+use std::collections::HashMap;
+
 use crate::index::Index;
 use crate::point::{Point, Score};
 use crate::vector::{distance, Vector};
 use rand::Rng;
 
+#[allow(non_snake_case)]
 pub struct HNSWIndex {
-    pub points: Vec<Point>, // a list of vectors, indexed by usize
-    pub neighbors: Vec<Vec<usize>>,
-    // a list of lists. the first index is the level. the second index is the
-    // index of the point in the points
+    // a list of points, indexed by usize
+    pub points: Vec<Point>,
+
+    // vec of layers containing (hashmap of point index -> list of neighbor point indicies)
+    pub neighbors: Vec<HashMap<usize, Vec<usize>>>,
+
+    // the enter point (root) of the tree
+    ep: usize,
+
+    // the highest layer of the tree (0 being the lowest)
+    L: usize,
+
+    // number of established connections
+    M: usize,
+
+    // maximum number of connections for each element per layer
+    M_max: usize,
+
+    // size of the candidate list at search time
+    ef: usize,
+
+    // size of the candidate list at construction time
+    ef_construction: usize,
+
+    // normalization factor for layer generation
+    mL: f32,
 }
 
 // https://zilliz.com/learn/hierarchical-navigable-small-worlds-HNSW
@@ -15,14 +40,30 @@ pub struct HNSWIndex {
 #[allow(non_snake_case)]
 impl HNSWIndex {
     pub fn new() -> Self {
+        let ep: usize = 0;
+
+        let L = 4;
+        let M = 16;
+        let M_max: usize = 2 * M;
+        let ef = 100;
+        let ef_construction = 2 * ef;
+        let mL = (L as f32).ln().recip();
+
         Self {
             points: vec![],
-            neighbors: vec![],
+            neighbors: vec![HashMap::new(); L],
+            ep,
+            L,
+            M,
+            M_max,
+            ef,
+            ef_construction,
+            mL,
         }
     }
 
     fn get_nearest_element(&self, q: &Vector, ep: &Vec<usize>) -> usize {
-        let mut min_distance = f32::INFINITY;
+        let mut min_distance = 1.0; // cosine similarity maximum value
         let mut nearest_element = 0;
         for e in ep.clone() {
             let d = distance(q, &self.points[e].vector);
@@ -35,7 +76,7 @@ impl HNSWIndex {
     }
 
     fn get_furthest_element(&self, q: &Vector, ep: &Vec<usize>) -> usize {
-        let mut max_distance = 0.0;
+        let mut max_distance = -1.0; // cosine similarity minimum value
         let mut furthest_element = 0;
         for e in ep.iter().cloned() {
             let d = distance(q, &self.points[e].vector);
@@ -47,53 +88,54 @@ impl HNSWIndex {
         furthest_element
     }
 
-    fn get_enter_point(&self) -> usize {
-        todo!()
-    }
-
-    fn get_top_layer(&self) -> usize {
-        self.points.len() - 1
-    }
-
-    fn get_level(&self, mL: usize) -> usize {
+    fn get_layer(&self, mL: f32) -> usize {
         let mut rng = rand::thread_rng();
         let r: f32 = rng.gen();
-        let l: usize = (r.ln() * mL as f32).floor() as usize;
+        let l: usize = (r.ln() * mL).abs().floor() as usize;
         l
     }
 
-    fn extract_nearest_element(&self, q: &Vector, ep: &Vec<usize>) -> usize {
+    fn extract_nearest_element(&self, q: &Vector, ep: &mut Vec<usize>) -> usize {
         let e = self.get_nearest_element(q, ep);
-        ep.remove(e);
+        // e is a value that should be removed, not an index
+        // TODO find a cleaner way to do this.
+        let i = ep.iter().position(|x| *x == e).unwrap();
+        ep.remove(i);
         e
     }
 
-    fn add_bidirectional_connections(&self, q: &Point, e: Vec<usize>, lc: usize) {
-        let q_index = self.points.len();
-        self.points.push(q.clone());
-        for e in e {
-            self.neighbors[lc].push(e);
-            self.neighbors[lc].push(q_index); // should be the index of q in self.points
+    fn add_bidirectional_connections(&mut self, q: usize, e: &Vec<usize>, lc: usize) {
+        for &e in e {
+            self.neighbors[lc].entry(q).or_insert_with(Vec::new).push(e);
+            self.neighbors[lc].entry(e).or_insert_with(Vec::new).push(q);
         }
     }
 
     /// ALGORITHM 1
     /// Inserts a new point, `q` into the HNSW tree.
     pub fn insert(
-        &self,
-        q: &Point,              // new element
-        M: usize,               // number of established connections
-        M_max: usize,           // maximum number of connections for each element per layer
-        ef_construction: usize, // size of the dyanmic candidate list
-        mL: usize,              // normalization factor for level generation
+        &mut self,
+        q: &Point, // new element
     ) {
-        let mut W = vec![]; // list for the currently found nearest elements
-        let mut ep = self.get_enter_point(); // the enter point for the tree
-        let L = self.get_top_layer(); // the highest layer of the tree (0 being the lowest)
-        let l = self.get_level(mL); // the random layer to which the new element will rise
+        let mut W: Vec<usize>;
+        let mut ep = self.ep.clone(); // the enter point for the tree
+        let l = self.get_layer(self.mL); // the random layer to which the new element will rise
+
+        // if the tree is empty, special case
+        if self.points.is_empty() {
+            self.points.push(q.clone());
+            self.neighbors.iter_mut().for_each(|layer| {
+                layer.insert(0, vec![]);
+            });
+            return;
+        }
+
+        // add the new element to the tree
+        let q_index = self.points.len();
+        self.points.push(q.clone());
 
         // for every layer from the top to one above where the new element will be inserted
-        for lc in L..l + 1 {
+        for lc in (l + 1..self.L).rev() {
             // in the current layer, grab the closest element to q
             W = self.search_layer(&q.vector, vec![ep], 1, lc);
             // update the enter point to the closest element to q
@@ -102,25 +144,25 @@ impl HNSWIndex {
         }
 
         // for every layer from either the top or the random layer to which the new element will rise
-        for lc in L.min(l)..0 {
+        for lc in (0..self.L.min(l)).rev() {
             // in the current layer, grab the closest elements to q
-            W = self.search_layer(&q.vector, vec![ep], ef_construction, lc);
-            // select the elements from this level that should be neighbors to the element being inserted
+            W = self.search_layer(&q.vector, vec![ep], self.ef_construction, lc);
+            // select the elements from this layer that should be neighbors to the element being inserted
             // but, aren't the results from search_layer in W already the ef_construction closest elements?
             // maybe M<ef_construction and this is a subset?
-            let neighbors = self.select_neighbors_simple(&q.vector, &W, M);
+            let neighbors = self.select_neighbors_simple(&q.vector, &W, self.M);
             // create connections between the query vector and the neighbors on layer lc
-            self.add_bidirectional_connections(q, neighbors, lc);
+            self.add_bidirectional_connections(q_index, &neighbors, lc);
             // for each newly connected neighbor
             for e in neighbors {
                 // get the neighbors' neighbors
-                let e_conn = self.neighbors[e];
+                let e_conn = self.neighbors[lc].get(&e).unwrap();
                 // if the neighbor now has too many neighbors (|e_conn| > M_max)
-                if e_conn.len() > M_max {
+                if e_conn.len() > self.M_max {
                     // reselect a properly-sized set of neighbors
                     let e_new_conn =
-                        self.select_neighbors_simple(&self.points[e].vector, &e_conn, M_max);
-                    self.neighbors[e] = e_new_conn;
+                        self.select_neighbors_simple(&self.points[e].vector, e_conn, self.M_max);
+                    self.neighbors[lc].insert(e, e_new_conn);
                 }
             }
         }
@@ -142,7 +184,7 @@ impl HNSWIndex {
         // while there are candidate points left to search...
         while C.len() > 0 {
             // get the closest element from the candidate list
-            let c = self.get_nearest_element(q, &C);
+            let c = self.extract_nearest_element(q, &mut C);
 
             // get the furthest element from the current nearest neighbors
             let f = self.get_furthest_element(q, &W);
@@ -150,14 +192,17 @@ impl HNSWIndex {
             // if the closest candidate element is further than the furthest
             // 'nearest' element, we're done. this seems like an optimization
             // that could be removed for clarity, but it's in the original paper
-            let dist_to_c = distance(&self.points[c].vector, q);
-            let dist_to_f = distance(&self.points[f].vector, q);
-            if dist_to_c > dist_to_f {
+            if distance(&self.points[c].vector, q) > distance(&self.points[f].vector, q) {
                 break; // all elements have been evaluated
             }
 
             // for each neighbor of the closest unvisited element to q
-            for e in self.neighbors[c].iter().cloned() {
+            for e in self.neighbors[lc]
+                .get(&c)
+                .unwrap_or(&vec![])
+                .iter()
+                .cloned()
+            {
                 // if the neighbor hasn't been visited yet
                 if !v.contains(&e) {
                     // mark the neighbor as visited
@@ -179,7 +224,8 @@ impl HNSWIndex {
                         // array than can be returned, bump the furthest from q
                         if W.len() > ef {
                             let x = self.get_furthest_element(q, &W);
-                            W.remove(x);
+                            let i = W.iter().position(|y| *y == x).unwrap();
+                            W.remove(i);
                         }
                     }
                 }
@@ -206,67 +252,67 @@ impl HNSWIndex {
     }
 
     /// ALGORITHM 4
-    fn select_neighbors_heuristic(
-        &self,
-        q: &Vector,                    // query vector
-        C: &Vec<usize>,                // candidate elements
-        M: usize,                      // number of neighbors to return
-        lc: usize,                     // layer number
-        extend_candidates: bool,       // flag indicating whether or not to extend candidate list
-        keep_pruned_connections: bool, // flag indicating whether or not to add discarded elements
-    ) -> Vec<usize> {
-        let mut R = vec![];
-        let mut W = C.clone();
+    // fn select_neighbors_heuristic(
+    //     &self,
+    //     q: &Vector,                    // query vector
+    //     C: &Vec<usize>,                // candidate elements
+    //     M: usize,                      // number of neighbors to return
+    //     lc: usize,                     // layer number
+    //     extend_candidates: bool,       // flag indicating whether or not to extend candidate list
+    //     keep_pruned_connections: bool, // flag indicating whether or not to add discarded elements
+    // ) -> Vec<usize> {
+    //     let mut R = vec![];
+    //     let mut W = C.clone();
 
-        if extend_candidates {
-            for e in C {
-                for e_adj in self.neighbors[e] {
-                    if !W.contains(&e_adj) {
-                        W.push(e_adj);
-                    }
-                }
-            }
-        }
+    //     if extend_candidates {
+    //         for e in C.iter().cloned() {
+    //             for e_adj in self.neighbors[lc].get(&e).unwrap().iter().cloned() {
+    //                 if !W.contains(&e_adj) {
+    //                     W.push(e_adj);
+    //                 }
+    //             }
+    //         }
+    //     }
 
-        let mut W_d = vec![];
+    //     let mut W_d = vec![];
 
-        while W.len() > 0 && R.len() < M {
-            let e = self.get_nearest_element(q, &W);
-            if distance(q, &self.points[e].vector)
-                < distance(
-                    q,
-                    &self.points[self.extract_nearest_element(&self.points[e].vector, &R)].vector,
-                )
-            {
-                R.push(e);
-            } else {
-                W_d.push(e);
-            }
-        }
+    //     while W.len() > 0 && R.len() < M {
+    //         let e = self.get_nearest_element(q, &W);
+    //         if distance(q, &self.points[e].vector)
+    //             < distance(
+    //                 q,
+    //                 &self.points[self.extract_nearest_element(&self.points[e].vector, &mut R)]
+    //                     .vector,
+    //             )
+    //         {
+    //             R.push(e);
+    //         } else {
+    //             W_d.push(e);
+    //         }
+    //     }
 
-        if keep_pruned_connections {
-            while W_d.len() > 0 && R.len() < M {
-                R.push(self.extract_nearest_element(q, &W_d));
-            }
-        }
+    //     if keep_pruned_connections {
+    //         while W_d.len() > 0 && R.len() < M {
+    //             R.push(self.extract_nearest_element(q, &mut W_d));
+    //         }
+    //     }
 
-        R
-    }
+    //     R
+    // }
 
     /// ALGORITHM 5
-    fn search(&self, q: &Vector, K: usize, ef: usize) -> Vec<(Score, &Point)> {
-        let mut W = vec![]; // set for the current nearest elements
-        let mut ep = self.get_enter_point(); // enter point for the hnsw tree
-        let L = self.get_top_layer(); // the highest layer of the tree (layer of enter point)
+    fn search(&self, q: &Vector, K: usize) -> Vec<(Score, &Point)> {
+        let mut W: Vec<usize>; // set for the current nearest elements
+        let mut ep = self.ep.clone(); // enter point for the hnsw tree
 
         // for each layer from the top to one above where the new element will be inserted
-        for lc in L..1 {
+        for lc in (1..self.L).rev() {
             W = self.search_layer(q, vec![ep], 1, lc); // get the closest elements to q
             ep = self.get_nearest_element(q, &W); // update the enter point to the closest element to q
         }
 
         // find the ef nearest elements to q
-        W = self.search_layer(q, vec![ep], ef, 0);
+        W = self.search_layer(q, vec![ep], self.ef, 0);
 
         let mut scores: Vec<(Score, &Point)> = W
             .iter()
@@ -283,10 +329,10 @@ impl HNSWIndex {
 
 impl Index for HNSWIndex {
     fn insert(&mut self, point: Point) {
-        todo!()
+        self.insert(&point);
     }
 
     fn search(&self, query: &Vector, k: usize) -> Vec<(Score, &Point)> {
-        todo!()
+        self.search(&query, k)
     }
 }

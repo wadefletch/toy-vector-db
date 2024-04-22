@@ -1,14 +1,18 @@
 use crate::point::Point;
-use std::fs::read_to_string;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 // Next, let's read the dataset from the file. As this is an NDJSON (Newline
 // Delimited JSON) file, we can use the `lines` method to read each line of the
 // file, then use serde_json to parse each line into a `Point` struct.
-pub fn read_dataset(filename: &str) -> Vec<Point> {
-    read_to_string(filename)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(&line).unwrap())
+pub fn read_ndjson<T: serde::de::DeserializeOwned>(filename: &str, limit: usize) -> Vec<T> {
+    let file = File::open(filename).unwrap();
+    let reader = BufReader::new(file);
+
+    let lines = reader.lines();
+    lines
+        .take(limit)
+        .filter_map(|line| serde_json::from_str::<T>(&line.ok()?).ok())
         .collect()
 }
 
